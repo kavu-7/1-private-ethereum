@@ -1,0 +1,3193 @@
+// HealthInsureChain - Complete Project Implementation
+// Directory Structure and Core Implementation
+
+/*
+PROJECT STRUCTURE:
+healthinsurechain/
+├── ethereum-private-chain/
+│   ├── contracts/
+│   │   ├── HealthInsurance.sol
+│   │   ├── HealthToken.sol
+│   │   └── PolicyStorage.sol
+│   ├── migrations/
+│   ├── test/
+│   ├── truffle-config.js
+│   └── package.json
+├── rust-miner/
+│   ├── src/
+│   │   ├── main.rs
+│   │   ├── miner.rs
+│   │   ├── block.rs
+│   │   └── lib.rs
+│   ├── Cargo.toml
+│   └── README.md
+├── hyperledger-fabric/
+│   ├── network/
+│   │   ├── docker-compose.yml
+│   │   ├── crypto-config.yaml
+│   │   └── configtx.yaml
+│   ├── chaincode/
+│   │   └── health-insurance/
+│   ├── application/
+│   └── scripts/
+├── cloud-interface/
+│   ├── frontend/
+│   │   ├── src/
+│   │   ├── public/
+│   │   ├── package.json
+│   │   └── README.md
+│   ├── backend/
+│   │   ├── controllers/
+│   │   ├── models/
+│   │   ├── routes/
+│   │   ├── middleware/
+│   │   └── server.js
+│   └── docker-compose.yml
+├── bigchaindb/
+│   ├── docker-compose.yml
+│   └── scripts/
+├── docs/
+├── scripts/
+└── README.md
+*/
+
+// =================== ETHEREUM SMART CONTRACTS ===================
+
+// contracts/HealthInsurance.sol
+const HealthInsuranceContract = `
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import "./HealthToken.sol";
+import "./PolicyStorage.sol";
+
+contract HealthInsurance {
+    address public owner;
+    HealthToken public healthToken;
+    PolicyStorage public policyStorage;
+    
+    struct Claim {
+        uint256 claimId;
+        string policyId;
+        address patient;
+        address hospital;
+        uint256 amount;
+        string diagnosis;
+        ClaimStatus status;
+        uint256 submissionTime;
+        uint256 verificationScore;
+        string[] documentHashes;
+    }
+    
+    enum ClaimStatus { PENDING, APPROVED, REJECTED, MANUAL_REVIEW }
+    
+    mapping(uint256 => Claim) public claims;
+    mapping(address => uint256[]) public patientClaims;
+    mapping(address => bool) public authorizedHospitals;
+    mapping(address => bool) public authorizedInsurers;
+    
+    uint256 public nextClaimId = 1;
+    uint256 public constant VERIFICATION_THRESHOLD = 80;
+    uint256 public constant MANUAL_REVIEW_THRESHOLD = 60;
+    
+    event PolicyCreated(string indexed policyId, address indexed patient, bytes32 policyHash);
+    event ClaimSubmitted(uint256 indexed claimId, string indexed policyId, address indexed patient);
+    event ClaimProcessed(uint256 indexed claimId, ClaimStatus status, uint256 verificationScore);
+    event TokensRewarded(address indexed patient, uint256 amount);
+    
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Only owner can call this function");
+        _;
+    }
+    
+    modifier onlyAuthorizedHospital() {
+        require(authorizedHospitals[msg.sender], "Only authorized hospitals can call this function");
+        _;
+    }
+    
+    modifier onlyAuthorizedInsurer() {
+        require(authorizedInsurers[msg.sender], "Only authorized insurers can call this function");
+        _;
+    }
+    
+    constructor(address _healthTokenAddress, address _policyStorageAddress) {
+        owner = msg.sender;
+        healthToken = HealthToken(_healthTokenAddress);
+        policyStorage = PolicyStorage(_policyStorageAddress);
+    }
+    
+    function authorizeHospital(address hospital) external onlyOwner {
+        authorizedHospitals[hospital] = true;
+    }
+    
+    function authorizeInsurer(address insurer) external onlyOwner {
+        authorizedInsurers[insurer] = true;
+    }
+    
+    function createPolicy(
+        string memory policyId,
+        address patient,
+        uint256 coverageAmount,
+        uint256 premium,
+        string[] memory conditions
+    ) external onlyAuthorizedInsurer {
+        bytes32 policyHash = policyStorage.storePolicy(policyId, patient, coverageAmount, premium, conditions);
+        emit PolicyCreated(policyId, patient, policyHash);
+    }
+    
+    function submitClaim(
+        string memory policyId,
+        address patient,
+        uint256 amount,
+        string memory diagnosis,
+        string[] memory documentHashes
+    ) external onlyAuthorizedHospital returns (uint256) {
+        require(policyStorage.isPolicyActive(policyId), "Policy not active");
+        require(policyStorage.getPolicyCoverage(policyId) >= amount, "Claim exceeds coverage");
+        
+        uint256 claimId = nextClaimId++;
+        
+        claims[claimId] = Claim({
+            claimId: claimId,
+            policyId: policyId,
+            patient: patient,
+            hospital: msg.sender,
+            amount: amount,
+            diagnosis: diagnosis,
+            status: ClaimStatus.PENDING,
+            submissionTime: block.timestamp,
+            verificationScore: 0,
+            documentHashes: documentHashes
+        });
+        
+        patientClaims[patient].push(claimId);
+        
+        emit ClaimSubmitted(claimId, policyId, patient);
+        
+        // Auto-process claim
+        _processClaim(claimId);
+        
+        return claimId;
+    }
+    
+    function _processClaim(uint256 claimId) internal {
+        Claim storage claim = claims[claimId];
+        uint256 score = _calculateVerificationScore(claim);
+        claim.verificationScore = score;
+        
+        if (score >= VERIFICATION_THRESHOLD) {
+            claim.status = ClaimStatus.APPROVED;
+            // Reward tokens
+            healthToken.mint(claim.patient, 100 * 10**18); // 100 tokens
+            emit TokensRewarded(claim.patient, 100 * 10**18);
+        } else if (score >= MANUAL_REVIEW_THRESHOLD) {
+            claim.status = ClaimStatus.MANUAL_REVIEW;
+        } else {
+            claim.status = ClaimStatus.REJECTED;
+        }
+        
+        emit ClaimProcessed(claimId, claim.status, score);
+    }
+    
+    function _calculateVerificationScore(Claim memory claim) internal pure returns (uint256) {
+        uint256 score = 50; // Base score
+        
+        // Document completeness (30 points)
+        if (claim.documentHashes.length >= 3) {
+            score += 30;
+        } else if (claim.documentHashes.length >= 2) {
+            score += 20;
+        } else if (claim.documentHashes.length >= 1) {
+            score += 10;
+        }
+        
+        // Amount reasonableness (20 points)
+        // This would typically compare against historical data
+        // For demo purposes, we'll use a simple heuristic
+        if (claim.amount <= 10000) {
+            score += 20;
+        } else if (claim.amount <= 50000) {
+            score += 15;
+        } else {
+            score += 5;
+        }
+        
+        return score > 100 ? 100 : score;
+    }
+    
+    function manualApproval(uint256 claimId) external onlyAuthorizedInsurer {
+        require(claims[claimId].status == ClaimStatus.MANUAL_REVIEW, "Claim not in manual review");
+        claims[claimId].status = ClaimStatus.APPROVED;
+        
+        // Reward tokens
+        healthToken.mint(claims[claimId].patient, 50 * 10**18); // 50 tokens for manual approval
+        emit TokensRewarded(claims[claimId].patient, 50 * 10**18);
+        
+        emit ClaimProcessed(claimId, ClaimStatus.APPROVED, claims[claimId].verificationScore);
+    }
+    
+    function getPatientClaims(address patient) external view returns (uint256[] memory) {
+        return patientClaims[patient];
+    }
+    
+    function getClaim(uint256 claimId) external view returns (Claim memory) {
+        return claims[claimId];
+    }
+}
+`;
+
+// contracts/HealthToken.sol
+const HealthTokenContract = `
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+interface IERC20 {
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address recipient, uint256 amount) external returns (bool);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+    
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+}
+
+contract HealthToken is IERC20 {
+    mapping(address => uint256) private _balances;
+    mapping(address => mapping(address => uint256)) private _allowances;
+    
+    uint256 private _totalSupply;
+    string public name;
+    string public symbol;
+    uint8 public decimals;
+    address public owner;
+    address public healthInsuranceContract;
+    
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Only owner can call this function");
+        _;
+    }
+    
+    modifier onlyHealthInsurance() {
+        require(msg.sender == healthInsuranceContract, "Only health insurance contract can mint");
+        _;
+    }
+    
+    constructor() {
+        name = "HealthCoin";
+        symbol = "HC";
+        decimals = 18;
+        owner = msg.sender;
+        _totalSupply = 1000000 * 10**decimals; // 1M initial supply
+        _balances[owner] = _totalSupply;
+        emit Transfer(address(0), owner, _totalSupply);
+    }
+    
+    function setHealthInsuranceContract(address _healthInsuranceContract) external onlyOwner {
+        healthInsuranceContract = _healthInsuranceContract;
+    }
+    
+    function totalSupply() public view override returns (uint256) {
+        return _totalSupply;
+    }
+    
+    function balanceOf(address account) public view override returns (uint256) {
+        return _balances[account];
+    }
+    
+    function transfer(address recipient, uint256 amount) public override returns (bool) {
+        _transfer(msg.sender, recipient, amount);
+        return true;
+    }
+    
+    function allowance(address owner, address spender) public view override returns (uint256) {
+        return _allowances[owner][spender];
+    }
+    
+    function approve(address spender, uint256 amount) public override returns (bool) {
+        _approve(msg.sender, spender, amount);
+        return true;
+    }
+    
+    function transferFrom(address sender, address recipient, uint256 amount) public override returns (bool) {
+        uint256 currentAllowance = _allowances[sender][msg.sender];
+        require(currentAllowance >= amount, "ERC20: transfer amount exceeds allowance");
+        
+        _transfer(sender, recipient, amount);
+        _approve(sender, msg.sender, currentAllowance - amount);
+        
+        return true;
+    }
+    
+    function mint(address to, uint256 amount) external onlyHealthInsurance {
+        _totalSupply += amount;
+        _balances[to] += amount;
+        emit Transfer(address(0), to, amount);
+    }
+    
+    function _transfer(address sender, address recipient, uint256 amount) internal {
+        require(sender != address(0), "ERC20: transfer from the zero address");
+        require(recipient != address(0), "ERC20: transfer to the zero address");
+        
+        uint256 senderBalance = _balances[sender];
+        require(senderBalance >= amount, "ERC20: transfer amount exceeds balance");
+        
+        _balances[sender] = senderBalance - amount;
+        _balances[recipient] += amount;
+        
+        emit Transfer(sender, recipient, amount);
+    }
+    
+    function _approve(address owner, address spender, uint256 amount) internal {
+        require(owner != address(0), "ERC20: approve from the zero address");
+        require(spender != address(0), "ERC20: approve to the zero address");
+        
+        _allowances[owner][spender] = amount;
+        emit Approval(owner, spender, amount);
+    }
+}
+`;
+
+// contracts/PolicyStorage.sol
+const PolicyStorageContract = `
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+contract PolicyStorage {
+    struct Policy {
+        string policyId;
+        address patient;
+        uint256 coverageAmount;
+        uint256 premium;
+        string[] conditions;
+        bool isActive;
+        uint256 createdAt;
+        bytes32 policyHash;
+    }
+    
+    mapping(string => Policy) public policies;
+    mapping(address => string[]) public patientPolicies;
+    mapping(bytes32 => bool) public policyHashes;
+    
+    address public healthInsuranceContract;
+    
+    modifier onlyHealthInsurance() {
+        require(msg.sender == healthInsuranceContract, "Only health insurance contract can call this");
+        _;
+    }
+    
+    constructor(address _healthInsuranceContract) {
+        healthInsuranceContract = _healthInsuranceContract;
+    }
+    
+    function storePolicy(
+        string memory policyId,
+        address patient,
+        uint256 coverageAmount,
+        uint256 premium,
+        string[] memory conditions
+    ) external onlyHealthInsurance returns (bytes32) {
+        bytes32 policyHash = keccak256(abi.encodePacked(policyId, patient, coverageAmount, premium, block.timestamp));
+        
+        policies[policyId] = Policy({
+            policyId: policyId,
+            patient: patient,
+            coverageAmount: coverageAmount,
+            premium: premium,
+            conditions: conditions,
+            isActive: true,
+            createdAt: block.timestamp,
+            policyHash: policyHash
+        });
+        
+        patientPolicies[patient].push(policyId);
+        policyHashes[policyHash] = true;
+        
+        return policyHash;
+    }
+    
+    function isPolicyActive(string memory policyId) external view returns (bool) {
+        return policies[policyId].isActive;
+    }
+    
+    function getPolicyCoverage(string memory policyId) external view returns (uint256) {
+        return policies[policyId].coverageAmount;
+    }
+    
+    function getPolicy(string memory policyId) external view returns (Policy memory) {
+        return policies[policyId];
+    }
+    
+    function getPatientPolicies(address patient) external view returns (string[] memory) {
+        return patientPolicies[patient];
+    }
+    
+    function deactivatePolicy(string memory policyId) external onlyHealthInsurance {
+        policies[policyId].isActive = false;
+    }
+}
+`;
+
+// =================== RUST MINER ===================
+
+const RustMinerCode = `
+// Cargo.toml
+[package]
+name = "health-insurance-miner"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sha2 = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+web3 = "0.19"
+hex = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.0", features = ["derive"] }
+
+// src/main.rs
+use clap::Parser;
+use std::time::Duration;
+use tokio::time::sleep;
+
+mod miner;
+mod block;
+
+use miner::Miner;
+
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    #[arg(short, long, default_value = "4")]
+    difficulty: u32,
+    
+    #[arg(short, long, default_value = "http://localhost:8545")]
+    ethereum_rpc: String,
+    
+    #[arg(short, long)]
+    contract_address: Option<String>,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+    
+    println!("🏥 HealthInsurance Rust Miner Starting...");
+    println!("Difficulty: {}", args.difficulty);
+    println!("Ethereum RPC: {}", args.ethereum_rpc);
+    
+    let mut miner = Miner::new(args.difficulty, &args.ethereum_rpc).await?;
+    
+    if let Some(contract_addr) = args.contract_address {
+        miner.set_contract_address(&contract_addr)?;
+    }
+    
+    // Start mining loop
+    loop {
+        match miner.mine_next_block().await {
+            Ok(block) => {
+                println!("✅ Block mined successfully!");
+                println!("Block Hash: {}", block.hash);
+                println!("Nonce: {}", block.nonce);
+                println!("Transactions: {}", block.transactions.len());
+                
+                // Submit to Ethereum contract if configured
+                if miner.has_contract() {
+                    match miner.submit_to_ethereum(&block).await {
+                        Ok(tx_hash) => println!("📤 Submitted to Ethereum: {}", tx_hash),
+                        Err(e) => eprintln!("❌ Failed to submit to Ethereum: {}", e),
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("❌ Mining error: {}", e);
+                sleep(Duration::from_secs(5)).await;
+            }
+        }
+        
+        // Wait before mining next block
+        sleep(Duration::from_secs(10)).await;
+    }
+}
+
+// src/miner.rs
+use sha2::{Sha256, Digest};
+use web3::{Web3, transports::Http, contract::Contract, types::Address};
+use std::str::FromStr;
+use crate::block::{Block, Transaction, PolicyTransaction, ClaimTransaction};
+
+pub struct Miner {
+    difficulty: u32,
+    web3: Option<Web3<Http>>,
+    contract: Option<Contract<Http>>,
+    current_block_index: u64,
+    previous_hash: String,
+}
+
+impl Miner {
+    pub async fn new(difficulty: u32, ethereum_rpc: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let web3 = if !ethereum_rpc.is_empty() {
+            let transport = Http::new(ethereum_rpc)?;
+            Some(Web3::new(transport))
+        } else {
+            None
+        };
+        
+        Ok(Miner {
+            difficulty,
+            web3,
+            contract: None,
+            current_block_index: 0,
+            previous_hash: "0".repeat(64),
+        })
+    }
+    
+    pub fn set_contract_address(&mut self, address: &str) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(web3) = &self.web3 {
+            let contract_address = Address::from_str(address)?;
+            // In a real implementation, you'd load the ABI from a file
+            let contract_abi = include_bytes!("../contracts/HealthInsurance.abi");
+            let contract = Contract::from_json(web3.eth(), contract_address, contract_abi)?;
+            self.contract = Some(contract);
+        }
+        Ok(())
+    }
+    
+    pub fn has_contract(&self) -> bool {
+        self.contract.is_some()
+    }
+    
+    pub async fn mine_next_block(&mut self) -> Result<Block, Box<dyn std::error::Error>> {
+        // Collect pending transactions (in a real implementation, this would come from a mempool)
+        let transactions = self.collect_pending_transactions().await;
+        
+        let mut block = Block {
+            index: self.current_block_index,
+            timestamp: chrono::Utc::now().timestamp() as u64,
+            previous_hash: self.previous_hash.clone(),
+            merkle_root: self.calculate_merkle_root(&transactions),
+            transactions,
+            nonce: 0,
+            hash: String::new(),
+        };
+        
+        // Mine the block
+        let target = "0".repeat(self.difficulty as usize);
+        loop {
+            block.hash = self.calculate_hash(&block);
+            if block.hash.starts_with(&target) {
+                break;
+            }
+            block.nonce += 1;
+            
+            if block.nonce % 10000 == 0 {
+                println!("Mining... Nonce: {}, Hash: {}", block.nonce, &block.hash[..10]);
+            }
+        }
+        
+        // Update for next block
+        self.previous_hash = block.hash.clone();
+        self.current_block_index += 1;
+        
+        Ok(block)
+    }
+    
+    async fn collect_pending_transactions(&self) -> Vec<Transaction> {
+        // In a real implementation, this would fetch from Ethereum mempool
+        // For demo, we'll create sample transactions
+        vec![
+            Transaction::Policy(PolicyTransaction {
+                policy_id: format!("POL{}", chrono::Utc::now().timestamp()),
+                patient_address: "0x742d35Cc6635C0532925a3b8D2aC6988DFC6d636".to_string(),
+                coverage_amount: 75000,
+                premium: 500,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+            Transaction::Claim(ClaimTransaction {
+                claim_id: format!("CLM{}", chrono::Utc::now().timestamp()),
+                policy_id: "POL123".to_string(),
+                patient_address: "0x742d35Cc6635C0532925a3b8D2aC6988DFC6d636".to_string(),
+                amount: 15000,
+                diagnosis: "Routine Checkup".to_string(),
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        ]
+    }
+    
+    fn calculate_hash(&self, block: &Block) -> String {
+        let mut hasher = Sha256::new();
+        let data = format!(
+            "{}{}{}{}{}{}",
+            block.index,
+            block.timestamp,
+            block.previous_hash,
+            block.merkle_root,
+            serde_json::to_string(&block.transactions).unwrap_or_default(),
+            block.nonce
+        );
+        hasher.update(data.as_bytes());
+        hex::encode(hasher.finalize())
+    }
+    
+    fn calculate_merkle_root(&self, transactions: &[Transaction]) -> String {
+        if transactions.is_empty() {
+            return "0".repeat(64);
+        }
+        
+        let mut hashes: Vec<String> = transactions
+            .iter()
+            .map(|tx| {
+                let mut hasher = Sha256::new();
+                hasher.update(serde_json::to_string(tx).unwrap_or_default().as_bytes());
+                hex::encode(hasher.finalize())
+            })
+            .collect();
+        
+        while hashes.len() > 1 {
+            let mut next_level = Vec::new();
+            for chunk in hashes.chunks(2) {
+                let mut hasher = Sha256::new();
+                hasher.update(chunk[0].as_bytes());
+                if chunk.len() > 1 {
+                    hasher.update(chunk[1].as_bytes());
+                } else {
+                    hasher.update(chunk[0].as_bytes()); // Duplicate if odd number
+                }
+                next_level.push(hex::encode(hasher.finalize()));
+            }
+            hashes = next_level;
+        }
+        
+        hashes[0].clone()
+    }
+    
+    pub async fn submit_to_ethereum(&self, block: &Block) -> Result<String, Box<dyn std::error::Error>> {
+        if let Some(contract) = &self.contract {
+            // Submit block hash to Ethereum contract
+            // This is a simplified version - in reality you'd call specific contract methods
+            let block_hash = hex::decode(&block.hash)?;
+            
+            // Example contract call (you'd implement the actual method)
+            // let tx_hash = contract.call("submitBlock", (block.index, block_hash), ...)?;
+            
+            // For demo purposes, return a mock transaction hash
+            Ok(format!("0x{}", hex::encode(&block.hash[..32])))
+        } else {
+            Err("No Ethereum contract configured".into())
+        }
+    }
+}
+
+// src/block.rs
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Block {
+    pub index: u64,
+    pub timestamp: u64,
+    pub previous_hash: String,
+    pub merkle_root: String,
+    pub transactions: Vec<Transaction>,
+    pub nonce: u64,
+    pub hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Transaction {
+    Policy(PolicyTransaction),
+    Claim(ClaimTransaction),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyTransaction {
+    pub policy_id: String,
+    pub patient_address: String,
+    pub coverage_amount: u64,
+    pub premium: u64,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaimTransaction {
+    pub claim_id: String,
+    pub policy_id: String,
+    pub patient_address: String,
+    pub amount: u64,
+    pub diagnosis: String,
+    pub timestamp: u64,
+}
+`;
+
+// =================== HYPERLEDGER FABRIC NETWORK ===================
+
+const FabricNetworkConfig = `
+# docker-compose.yml for Hyperledger Fabric Network
+version: '3.7'
+
+volumes:
+  orderer.healthinsure.com:
+  peer0.hospital.healthinsure.com:
+  peer0.insurance.healthinsure.com:
+  peer0.patient.healthinsure.com:
+
+networks:
+  healthinsure:
+    name: healthinsure
+
+services:
+  # Orderer Service
+  orderer.healthinsure.com:
+    container_name: orderer.healthinsure.com
+    image: hyperledger/fabric-orderer:latest
+    labels:
+      service: hyperledger-fabric
+    environment:
+      - FABRIC_LOGGING_SPEC=INFO
+      - ORDERER_GENERAL_LISTENADDRESS=0.0.0.0
+      - ORDERER_GENERAL_LISTENPORT=7050
+      - ORDERER_GENERAL_LOCALMSPID=OrdererMSP
+      - ORDERER_GENERAL_LOCALMSPDIR=/var/hyperledger/orderer/msp
+      - ORDERER_GENERAL_TLS_ENABLED=true
+      - ORDERER_GENERAL_TLS_PRIVATEKEY=/var/hyperledger/orderer/tls/server.key
+      - ORDERER_GENERAL_TLS_CERTIFICATE=/var/hyperledger/orderer/tls/server.crt
+      - ORDERER_GENERAL_TLS_ROOTCAS=[/var/hyperledger/orderer/tls/ca.crt]
+      - ORDERER_GENERAL_CLUSTER_CLIENTCERTIFICATE=/var/hyperledger/orderer/tls/server.crt
+      - ORDERER_GENERAL_CLUSTER_CLIENTPRIVATEKEY=/var/hyperledger/orderer/tls/server.key
+      - ORDERER_GENERAL_CLUSTER_ROOTCAS=[/var/hyperledger/orderer/tls/ca.crt]
+      - ORDERER_GENERAL_BOOTSTRAPMETHOD=none
+      - ORDERER_CHANNELPARTICIPATION_ENABLED=true
+      - ORDERER_ADMIN_TLS_ENABLED=true
+      - ORDERER_ADMIN_TLS_CERTIFICATE=/var/hyperledger/orderer/tls/server.crt
+      - ORDERER_ADMIN_TLS_PRIVATEKEY=/var/hyperledger/orderer/tls/server.key
+      - ORDERER_ADMIN_TLS_ROOTCAS=[/var/hyperledger/orderer/tls/ca.crt]
+      - ORDERER_ADMIN_TLS_CLIENTROOTCAS=[/var/hyperledger/orderer/tls/ca.crt]
+      - ORDERER_ADMIN_LISTENADDRESS=0.0.0.0:7053
+      - ORDERER_OPERATIONS_LISTENADDRESS=orderer.healthinsure.com:9443
+      - ORDERER_METRICS_PROVIDER=prometheus
+    working_dir: /root
+    command: orderer
+    volumes:
+      - ../organizations/ordererOrganizations/healthinsure.com/orderers/orderer.healthinsure.com/msp:/var/hyperledger/orderer/msp
+      - ../organizations/ordererOrganizations/healthinsure.com/orderers/orderer.healthinsure.com/tls:/var/hyperledger/orderer/tls
+      - orderer.healthinsure.com:/var/hyperledger/production/orderer
+    ports:
+      - 7050:7050
+      - 7053:7053
+      - 9443:9443
+    networks:
+      - healthinsure
+
+  # Hospital Peer
+  peer0.hospital.healthinsure.com:
+    container_name: peer0.hospital.healthinsure.com
+    image: hyperledger/fabric-peer:latest
+    labels:
+      service: hyperledger-fabric
+    environment:
+      - FABRIC_CFG_PATH=/etc/hyperledger/peercfg
+      - FABRIC_LOGGING_SPEC=INFO
+      - CORE_PEER_TLS_ENABLED=true
+      - CORE_PEER_PROFILE_ENABLED=false
+      - CORE_PEER_TLS_CERT_FILE=/etc/hyperledger/fabric/tls/server.crt
+      - CORE_PEER_TLS_KEY_FILE=/etc/hyperledger/fabric/tls/server.key
+      - CORE_PEER_TLS_ROOTCERT_FILE=/etc/hyperledger/fabric/tls/ca.crt
+      - CORE_PEER_ID=peer0.hospital.healthinsure.com
+      - CORE_PEER_ADDRESS=peer0.hospital.healthinsure.com:7051
+      - CORE_PEER_LISTENADDRESS=0.0.0.0:7051
+      - CORE_PEER_CHAINCODEADDRESS=peer0.hospital.healthinsure.com:7052
+      - CORE_PEER_CHAINCODELISTENADDRESS=0.0.0.0:7052
+      - CORE_PEER_GOSSIP_BOOTSTRAP=peer0.hospital.healthinsure.com:7051
+      - CORE_PEER_GOSSIP_EXTERNALENDPOINT=peer0.hospital.healthinsure.com:7051
+      - CORE_PEER_LOCALMSPID=HospitalMSP
+      - CORE_PEER_MSPCONFIGPATH=/etc/hyperledger/fabric/msp
+      - CORE_OPERATIONS_LISTENADDRESS=peer0.hospital.healthinsure.com:9444
+      - CORE_METRICS_PROVIDER=prometheus
+      - CHAINCODE_AS_A_SERVICE_BUILDER_CONFIG={"peername":"peer0hospital"}
+      - CORE_CHAINCODE_EXECUTETIMEOUT=300s
+    volumes:
+      - ../organizations/peerOrganizations/hospital.healthinsure.com/peers/peer0.hospital.healthinsure.com:/etc/hyperledger/fabric
+      - peer0.hospital.healthinsure.com:/var/hyperledger/production
+    working_dir: /root
+    command: peer node start
+    ports:
+      - 7051:7051
+      - 9444:9444
+    networks:
+      - healthinsure
+
+  # Insurance Peer
+  peer0.insurance.healthinsure.com:
+    container_name: peer0.insurance.healthinsure.com
+    image: hyperledger/fabric-peer:latest
+    labels:
+      service: hyperledger-fabric
+    environment:
+      - FABRIC_CFG_PATH=/etc/hyperledger/peercfg
+      - FABRIC_LOGGING_SPEC=INFO
+      - CORE_PEER_TLS_ENABLED=true
+      - CORE_PEER_PROFILE_ENABLED=false
+      - CORE_PEER_TLS_CERT_FILE=/etc/hyperledger/fabric/tls/server.crt
+      - CORE_PEER_TLS_KEY_FILE=/etc/hyperledger/fabric/tls/server.key
+      - CORE_PEER_TLS_ROOTCERT_FILE=/etc/hyperledger/fabric/tls/ca.crt
+      - CORE_PEER_ID=peer0.insurance.healthinsure.com
+      - CORE_PEER_ADDRESS=peer0.insurance.healthinsure.com:9051
+      - CORE_PEER_LISTENADDRESS=0.0.0.0:9051
+      - CORE_PEER_CHAINCODEADDRESS=peer0.insurance.healthinsure.com:9052
+      - CORE_PEER_CHAINCODELISTENADDRESS=0.0.0.0:9052
+      - CORE_PEER_GOSSIP_BOOTSTRAP=peer0.insurance.healthinsure.com:9051
+      - CORE_PEER_GOSSIP_EXTERNALENDPOINT=peer0.insurance.healthinsure.com:9051
+      - CORE_PEER_LOCALMSPID=InsuranceMSP
+      - CORE_PEER_MSPCONFIGPATH=/etc/hyperledger/fabric/msp
+      - CORE_OPERATIONS_LISTENADDRESS=peer0.insurance.healthinsure.com:9445
+      - CORE_METRICS_PROVIDER=prometheus
+      - CHAINCODE_AS_A_SERVICE_BUILDER_CONFIG={"peername":"peer0insurance"}
+      - CORE_CHAINCODE_EXECUTETIMEOUT=300s
+    volumes:
+      - ../organizations/peerOrganizations/insurance.healthinsure.com/peers/peer0.insurance.healthinsure.com:/etc/hyperledger/fabric
+      - peer0.insurance.healthinsure.com:/var/hyperledger/production
+    working_dir: /root
+    command: peer node start
+    ports:
+      - 9051:9051
+      - 9445:9445
+    networks:
+      - healthinsure
+
+  # Patient Peer
+  peer0.patient.healthinsure.com:
+    container_name: peer0.patient.healthinsure.com
+    image: hyperledger/fabric-peer:latest
+    labels:
+      service: hyperledger-fabric
+    environment:
+      - FABRIC_CFG_PATH=/etc/hyperledger/peercfg
+      - FABRIC_LOGGING_SPEC=INFO
+      - CORE_PEER_TLS_ENABLED=true
+      - CORE_PEER_PROFILE_ENABLED=false
+      - CORE_PEER_TLS_CERT_FILE=/etc/hyperledger/fabric/tls/server.crt
+      - CORE_PEER_TLS_KEY_FILE=/etc/hyperledger/fabric/tls/server.key
+      - CORE_PEER_TLS_ROOTCERT_FILE=/etc/hyperledger/fabric/tls/ca.crt
+      - CORE_PEER_ID=peer0.patient.healthinsure.com
+      - CORE_PEER_ADDRESS=peer0.patient.healthinsure.com:11051
+      - CORE_PEER_LISTENADDRESS=0.0.0.0:11051
+      - CORE_PEER_CHAINCODEADDRESS=peer0.patient.healthinsure.com:11052
+      - CORE_PEER_CHAINCODELISTENADDRESS=0.0.0.0:11052
+      - CORE_PEER_GOSSIP_BOOTSTRAP=peer0.patient.healthinsure.com:11051
+      - CORE_PEER_GOSSIP_EXTERNALENDPOINT=peer0.patient.healthinsure.com:11051
+      - CORE_PEER_LOCALMSPID=PatientMSP
+      - CORE_PEER_MSPCONFIGPATH=/etc/hyperledger/fabric/msp
+      - CORE_OPERATIONS_LISTENADDRESS=peer0.patient.healthinsure.com:9446
+      - CORE_METRICS_PROVIDER=prometheus
+      - CHAINCODE_AS_A_SERVICE_BUILDER_CONFIG={"peername":"peer0patient"}
+      - CORE_CHAINCODE_EXECUTETIMEOUT=300s
+    volumes:
+      - ../organizations/peerOrganizations/patient.healthinsure.com/peers/peer0.patient.healthinsure.com:/etc/hyperledger/fabric
+      - peer0.patient.healthinsure.com:/var/hyperledger/production
+    working_dir: /root
+    command: peer node start
+    ports:
+      - 11051:11051
+      - 9446:9446
+    networks:
+      - healthinsure
+
+  # CLI Container for administration
+  cli:
+    container_name: cli
+    image: hyperledger/fabric-tools:latest
+    labels:
+      service: hyperledger-fabric
+    tty: true
+    stdin_open: true
+    environment:
+      - GOPATH=/opt/gopath
+      - FABRIC_LOGGING_SPEC=INFO
+      - FABRIC_CFG_PATH=/etc/hyperledger/peercfg
+    working_dir: /opt/gopath/src/github.com/hyperledger/fabric/peer
+    command: /bin/bash
+    volumes:
+      - ../organizations:/opt/gopath/src/github.com/hyperledger/fabric/peer/organizations
+      - ../scripts:/opt/gopath/src/github.com/hyperledger/fabric/peer/scripts/
+    depends_on:
+      - peer0.hospital.healthinsure.com
+      - peer0.insurance.healthinsure.com
+      - peer0.patient.healthinsure.com
+    networks:
+      - healthinsure
+`;
+
+// =================== FABRIC CHAINCODE ===================
+
+const FabricChaincode = `
+// chaincode/health-insurance/main.go
+package main
+
+import (
+    "encoding/json"
+    "fmt"
+    "log"
+    "time"
+
+    "github.com/hyperledger/fabric-contract-api-go/contractapi"
+)
+
+// HealthInsuranceContract provides functions for managing health insurance
+type HealthInsuranceContract struct {
+    contractapi.Contract
+}
+
+// Policy represents a health insurance policy
+type Policy struct {
+    PolicyID        string    \`json:"policyId"\`
+    PatientID       string    \`json:"patientId"\`
+    InsuranceCompany string   \`json:"insuranceCompany"\`
+    CoverageAmount  uint64    \`json:"coverageAmount"\`
+    Premium         uint64    \`json:"premium"\`
+    Conditions      []string  \`json:"conditions"\`
+    IsActive        bool      \`json:"isActive"\`
+    CreatedAt       time.Time \`json:"createdAt"\`
+    PolicyHash      string    \`json:"policyHash"\`
+}
+
+// Claim represents an insurance claim
+type Claim struct {
+    ClaimID           string    \`json:"claimId"\`
+    PolicyID          string    \`json:"policyId"\`
+    PatientID         string    \`json:"patientId"\`
+    HospitalID        string    \`json:"hospitalId"\`
+    Diagnosis         string    \`json:"diagnosis"\`
+    TreatmentCost     uint64    \`json:"treatmentCost"\`
+    Status            string    \`json:"status"\` // PENDING, APPROVED, REJECTED
+    SubmittedAt       time.Time \`json:"submittedAt"\`
+    VerificationScore uint8     \`json:"verificationScore"\`
+    DocumentHashes    []string  \`json:"documentHashes"\`
+    ApprovedBy        string    \`json:"approvedBy,omitempty"\`
+    RejectionReason   string    \`json:"rejectionReason,omitempty"\`
+}
+
+// DataSharingRecord tracks inter-organizational data sharing
+type DataSharingRecord struct {
+    RecordID    string    \`json:"recordId"\`
+    FromOrg     string    \`json:"fromOrg"\`
+    ToOrg       string    \`json:"toOrg"\`
+    DataType    string    \`json:"dataType"\`
+    DataHash    string    \`json:"dataHash"\`
+    SharedAt    time.Time \`json:"sharedAt"\`
+    Authorized  bool      \`json:"authorized"\`
+    Purpose     string    \`json:"purpose"\`
+}
+
+// CreatePolicy creates a new health insurance policy
+func (hic *HealthInsuranceContract) CreatePolicy(ctx contractapi.TransactionContextInterface, policyID, patientID, insuranceCompany string, coverageAmount, premium uint64, conditions []string) error {
+    // Check if policy already exists
+    existingPolicy, err := ctx.GetStub().GetState(policyID)
+    if err != nil {
+        return fmt.Errorf("failed to check if policy exists: %v", err)
+    }
+    if existingPolicy != nil {
+        return fmt.Errorf("policy %s already exists", policyID)
+    }
+
+    // Get client identity
+    clientOrgID, err := ctx.GetClientIdentity().GetMSPID()
+    if err != nil {
+        return fmt.Errorf("failed to get client identity: %v", err)
+    }
+
+    // Only insurance organizations can create policies
+    if clientOrgID != "InsuranceMSP" {
+        return fmt.Errorf("only insurance organizations can create policies")
+    }
+
+    policy := Policy{
+        PolicyID:        policyID,
+        PatientID:       patientID,
+        InsuranceCompany: insuranceCompany,
+        CoverageAmount:  coverageAmount,
+        Premium:         premium,
+        Conditions:      conditions,
+        IsActive:        true,
+        CreatedAt:       time.Now(),
+        PolicyHash:      generatePolicyHash(policyID, patientID, coverageAmount),
+    }
+
+    policyJSON, err := json.Marshal(policy)
+    if err != nil {
+        return fmt.Errorf("failed to marshal policy: %v", err)
+    }
+
+    err = ctx.GetStub().PutState(policyID, policyJSON)
+    if err != nil {
+        return fmt.Errorf("failed to put policy to world state: %v", err)
+    }
+
+    // Emit event
+    err = ctx.GetStub().SetEvent("PolicyCreated", policyJSON)
+    if err != nil {
+        return fmt.Errorf("failed to set event: %v", err)
+    }
+
+    return nil
+}
+
+// SubmitClaim submits a new insurance claim
+func (hic *HealthInsuranceContract) SubmitClaim(ctx contractapi.TransactionContextInterface, claimID, policyID, patientID, hospitalID, diagnosis string, treatmentCost uint64, documentHashes []string) error {
+    // Get client identity
+    clientOrgID, err := ctx.GetClientIdentity().GetMSPID()
+    if err != nil {
+        return fmt.Errorf("failed to get client identity: %v", err)
+    }
+
+    // Only hospitals can submit claims
+    if clientOrgID != "HospitalMSP" {
+        return fmt.Errorf("only hospitals can submit claims")
+    }
+
+    // Verify policy exists and is active
+    policyJSON, err := ctx.GetStub().GetState(policyID)
+    if err != nil {
+        return fmt.Errorf("failed to read policy: %v", err)
+    }
+    if policyJSON == nil {
+        return fmt.Errorf("policy %s does not exist", policyID)
+    }
+
+    var policy Policy
+    err = json.Unmarshal(policyJSON, &policy)
+    if err != nil {
+        return fmt.Errorf("failed to unmarshal policy: %v", err)
+    }
+
+    if !policy.IsActive {
+        return fmt.Errorf("policy %s is not active", policyID)
+    }
+
+    if policy.PatientID != patientID {
+        return fmt.Errorf("patient ID mismatch")
+    }
+
+    if treatmentCost > policy.CoverageAmount {
+        return fmt.Errorf("treatment cost exceeds coverage amount")
+    }
+
+    // Create claim
+    claim := Claim{
+        ClaimID:           claimID,
+        PolicyID:          policyID,
+        PatientID:         patientID,
+        HospitalID:        hospitalID,
+        Diagnosis:         diagnosis,
+        TreatmentCost:     treatmentCost,
+        Status:            "PENDING",
+        SubmittedAt:       time.Now(),
+        VerificationScore: calculateVerificationScore(treatmentCost, documentHashes),
+        DocumentHashes:    documentHashes,
+    }
+
+    // Auto-process based on verification score
+    if claim.VerificationScore >= 80 {
+        claim.Status = "APPROVED"
+    } else if claim.VerificationScore >= 60 {
+        claim.Status = "MANUAL_REVIEW"
+    } else {
+        claim.Status = "REJECTED"
+        claim.RejectionReason = "Failed automated verification"
+    }
+
+    claimJSON, err := json.Marshal(claim)
+    if err != nil {
+        return fmt.Errorf("failed to marshal claim: %v", err)
+    }
+
+    err = ctx.GetStub().PutState(claimID, claimJSON)
+    if err != nil {
+        return fmt.Errorf("failed to put claim to world state: %v", err)
+    }
+
+    // Emit event
+    err = ctx.GetStub().SetEvent("ClaimSubmitted", claimJSON)
+    if err != nil {
+        return fmt.Errorf("failed to set event: %v", err)
+    }
+
+    return nil
+}
+
+// ApproveClaim manually approves a claim
+func (hic *HealthInsuranceContract) ApproveClaim(ctx contractapi.TransactionContextInterface, claimID string) error {
+    // Get client identity
+    clientOrgID, err := ctx.GetClientIdentity().GetMSPID()
+    if err != nil {
+        return fmt.Errorf("failed to get client identity: %v", err)
+    }
+
+    // Only insurance organizations can approve claims
+    if clientOrgID != "InsuranceMSP" {
+        return fmt.Errorf("only insurance organizations can approve claims")
+    }
+
+    claimJSON, err := ctx.GetStub().GetState(claimID)
+    if err != nil {
+        return fmt.Errorf("failed to read claim: %v", err)
+    }
+    if claimJSON == nil {
+        return fmt.Errorf("claim %s does not exist", claimID)
+    }
+
+    var claim Claim
+    err = json.Unmarshal(claimJSON, &claim)
+    if err != nil {
+        return fmt.Errorf("failed to unmarshal claim: %v", err)
+    }
+
+    if claim.Status == "APPROVED" {
+        return fmt.Errorf("claim is already approved")
+    }
+
+    clientID, err := ctx.GetClientIdentity().GetID()
+    if err != nil {
+        return fmt.Errorf("failed to get client ID: %v", err)
+    }
+
+    claim.Status = "APPROVED"
+    claim.ApprovedBy = clientID
+
+    claimJSON, err = json.Marshal(claim)
+    if err != nil {
+        return fmt.Errorf("failed to marshal claim: %v", err)
+    }
+
+    err = ctx.GetStub().PutState(claimID, claimJSON)
+    if err != nil {
+        return fmt.Errorf("failed to update claim: %v", err)
+    }
+
+    // Emit event
+    err = ctx.GetStub().SetEvent("ClaimApproved", claimJSON)
+    if err != nil {
+        return fmt.Errorf("failed to set event: %v", err)
+    }
+
+    return nil
+}
+
+// ShareData records inter-organizational data sharing
+func (hic *HealthInsuranceContract) ShareData(ctx contractapi.TransactionContextInterface, recordID, toOrg, dataType, dataHash, purpose string) error {
+    clientOrgID, err := ctx.GetClientIdentity().GetMSPID()
+    if err != nil {
+        return fmt.Errorf("failed to get client identity: %v", err)
+    }
+
+    // Verify organizations are authorized to share data
+    if !isAuthorizedForDataSharing(clientOrgID, toOrg) {
+        return fmt.Errorf("unauthorized data sharing between %s and %s", clientOrgID, toOrg)
+    }
+
+    sharingRecord := DataSharingRecord{
+        RecordID:   recordID,
+        FromOrg:    clientOrgID,
+        ToOrg:      toOrg,
+        DataType:   dataType,
+        DataHash:   dataHash,
+        SharedAt:   time.Now(),
+        Authorized: true,
+        Purpose:    purpose,
+    }
+
+    recordJSON, err := json.Marshal(sharingRecord)
+    if err != nil {
+        return fmt.Errorf("failed to marshal sharing record: %v", err)
+    }
+
+    err = ctx.GetStub().PutState(recordID, recordJSON)
+    if err != nil {
+        return fmt.Errorf("failed to put sharing record to world state: %v", err)
+    }
+
+    // Emit event
+    err = ctx.GetStub().SetEvent("DataShared", recordJSON)
+    if err != nil {
+        return fmt.Errorf("failed to set event: %v", err)
+    }
+
+    return nil
+}
+
+// GetPolicy retrieves a policy by ID
+func (hic *HealthInsuranceContract) GetPolicy(ctx contractapi.TransactionContextInterface, policyID string) (*Policy, error) {
+    policyJSON, err := ctx.GetStub().GetState(policyID)
+    if err != nil {
+        return nil, fmt.Errorf("failed to read policy: %v", err)
+    }
+    if policyJSON == nil {
+        return nil, fmt.Errorf("policy %s does not exist", policyID)
+    }
+
+    var policy Policy
+    err = json.Unmarshal(policyJSON, &policy)
+    if err != nil {
+        return nil, fmt.Errorf("failed to unmarshal policy: %v", err)
+    }
+
+    return &policy, nil
+}
+
+// GetClaim retrieves a claim by ID
+func (hic *HealthInsuranceContract) GetClaim(ctx contractapi.TransactionContextInterface, claimID string) (*Claim, error) {
+    claimJSON, err := ctx.GetStub().GetState(claimID)
+    if err != nil {
+        return nil, fmt.Errorf("failed to read claim: %v", err)
+    }
+    if claimJSON == nil {
+        return nil, fmt.Errorf("claim %s does not exist", claimID)
+    }
+
+    var claim Claim
+    err = json.Unmarshal(claimJSON, &claim)
+    if err != nil {
+        return nil, fmt.Errorf("failed to unmarshal claim: %v", err)
+    }
+
+    return &claim, nil
+}
+
+// GetPatientClaims retrieves all claims for a patient
+func (hic *HealthInsuranceContract) GetPatientClaims(ctx contractapi.TransactionContextInterface, patientID string) ([]*Claim, error) {
+    queryString := fmt.Sprintf(\`{"selector":{"patientId":"%s"}}\`, patientID)
+    
+    resultsIterator, err := ctx.GetStub().GetQueryResult(queryString)
+    if err != nil {
+        return nil, fmt.Errorf("failed to get query result: %v", err)
+    }
+    defer resultsIterator.Close()
+
+    var claims []*Claim
+    for resultsIterator.HasNext() {
+        queryResponse, err := resultsIterator.Next()
+        if err != nil {
+            return nil, fmt.Errorf("failed to get next query result: %v", err)
+        }
+
+        var claim Claim
+        err = json.Unmarshal(queryResponse.Value, &claim)
+        if err != nil {
+            return nil, fmt.Errorf("failed to unmarshal claim: %v", err)
+        }
+        claims = append(claims, &claim)
+    }
+
+    return claims, nil
+}
+
+// Helper functions
+func generatePolicyHash(policyID, patientID string, coverageAmount uint64) string {
+    return fmt.Sprintf("hash_%s_%s_%d", policyID, patientID, coverageAmount)
+}
+
+func calculateVerificationScore(treatmentCost uint64, documentHashes []string) uint8 {
+    score := uint8(50) // Base score
+
+    // Document completeness (30 points)
+    docScore := len(documentHashes) * 10
+    if docScore > 30 {
+        docScore = 30
+    }
+    score += uint8(docScore)
+
+    // Amount reasonableness (20 points)
+    if treatmentCost <= 10000 {
+        score += 20
+    } else if treatmentCost <= 50000 {
+        score += 15
+    } else {
+        score += 5
+    }
+
+    if score > 100 {
+        score = 100
+    }
+
+    return score
+}
+
+func isAuthorizedForDataSharing(fromOrg, toOrg string) bool {
+    // Define authorized data sharing pairs
+    authorizedPairs := map[string][]string{
+        "HospitalMSP":  {"InsuranceMSP", "PatientMSP"},
+        "InsuranceMSP": {"HospitalMSP", "PatientMSP"},
+        "PatientMSP":   {"HospitalMSP", "InsuranceMSP"},
+    }
+
+    allowedOrgs, exists := authorizedPairs[fromOrg]
+    if !exists {
+        return false
+    }
+
+    for _, org := range allowedOrgs {
+        if org == toOrg {
+            return true
+        }
+    }
+
+    return false
+}
+
+func main() {
+    healthInsuranceContract := new(HealthInsuranceContract)
+
+    cc, err := contractapi.NewChaincode(healthInsuranceContract)
+    if err != nil {
+        log.Panicf("Error creating health insurance chaincode: %v", err)
+    }
+
+    if err := cc.Start(); err != nil {
+        log.Panicf("Error starting health insurance chaincode: %v", err)
+    }
+}
+`;
+
+// =================== CLOUD INTERFACE - BACKEND ===================
+
+const CloudBackend = `
+// backend/server.js
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const { connectToMongoDB } = require('./config/database');
+const { initializeWeb3 } = require('./config/web3');
+const { initializeFabric } = require('./config/fabric');
+const { initializeBigchainDB } = require('./config/bigchaindb');
+
+// Route imports
+const authRoutes = require('./routes/auth');
+const policyRoutes = require('./routes/policies');
+const claimRoutes = require('./routes/claims');
+const patientRoutes = require('./routes/patients');
+const hospitalRoutes = require('./routes/hospitals');
+const insuranceRoutes = require('./routes/insurance');
+const blockchainRoutes = require('./routes/blockchain');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Security middleware
+app.use(helmet());
+app.use(cors({
+    origin: process.env.FRONTEND_URL || 'http://localhost:3001',
+    credentials: true
+}));
+
+// Rate limiting
+const limiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 100 // limit each IP to 100 requests per windowMs
+});
+app.use(limiter);
+
+// Body parsing middleware
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true }));
+
+// Initialize blockchain connections
+async function initializeBlockchainConnections() {
+    try {
+        await initializeWeb3();
+        console.log('✅ Ethereum connection initialized');
+        
+        await initializeFabric();
+        console.log('✅ Hyperledger Fabric connection initialized');
+        
+        await initializeBigchainDB();
+        console.log('✅ BigchainDB connection initialized');
+        
+        await connectToMongoDB();
+        console.log('✅ MongoDB connection initialized');
+    } catch (error) {
+        console.error('❌ Failed to initialize blockchain connections:', error);
+        process.exit(1);
+    }
+}
+
+// Routes
+app.use('/api/auth', authRoutes);
+app.use('/api/policies', policyRoutes);
+app.use('/api/claims', claimRoutes);
+app.use('/api/patients', patientRoutes);
+app.use('/api/hospitals', hospitalRoutes);
+app.use('/api/insurance', insuranceRoutes);
+app.use('/api/blockchain', blockchainRoutes);
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+    res.json({
+        status: 'healthy',
+        timestamp: new Date().toISOString(),
+        services: {
+            ethereum: 'connected',
+            fabric: 'connected',
+            bigchaindb: 'connected',
+            mongodb: 'connected'
+        }
+    });
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+    console.error(err.stack);
+    res.status(500).json({
+        error: 'Something went wrong!',
+        message: process.env.NODE_ENV === 'development' ? err.message : 'Internal server error'
+    });
+});
+
+// 404 handler
+app.use('*', (req, res) => {
+    res.status(404).json({ error: 'Route not found' });
+});
+
+// Start server
+async function startServer() {
+    try {
+        await initializeBlockchainConnections();
+        
+        app.listen(PORT, () => {
+            console.log(\`🚀 HealthInsureChain API server running on port \${PORT}\`);
+            console.log(\`📚 API Documentation: http://localhost:\${PORT}/api/docs\`);
+        });
+    } catch (error) {
+        console.error('❌ Failed to start server:', error);
+        process.exit(1);
+    }
+}
+
+startServer();
+
+// backend/routes/claims.js
+const express = require('express');
+const router = express.Router();
+const { authenticateToken, checkRole } = require('../middleware/auth');
+const { submitClaimToEthereum } = require('../services/ethereum');
+const { submitClaimToFabric } = require('../services/fabric');
+const { storeLargeClaimToBigchainDB } = require('../services/bigchaindb');
+const { validateClaim } = require('../middleware/validation');
+
+// Submit new claim
+router.post('/submit', authenticateToken, checkRole(['hospital']), validateClaim, async (req, res) => {
+    try {
+        const {
+            policyId,
+            patientId,
+            diagnosis,
+            treatmentCost,
+            documentHashes,
+            hospitalId
+        } = req.body;
+
+        const claimId = \`CLM\${Date.now()}\`;
+        
+        // Submit to Hyperledger Fabric first
+        const fabricResult = await submitClaimToFabric({
+            claimId,
+            policyId,
+            patientId,
+            hospitalId,
+            diagnosis,
+            treatmentCost,
+            documentHashes
+        });
+
+        // Submit to Ethereum smart contract
+        const ethereumResult = await submitClaimToEthereum({
+            claimId,
+            policyId,
+            patientId,
+            treatmentCost,
+            diagnosis,
+            documentHashes
+        });
+
+        // Store large claims in BigchainDB
+        let bigchainResult = null;
+        if (treatmentCost > 50000) {
+            bigchainResult = await storeLargeClaimToBigchainDB({
+                claimId,
+                policyId,
+                patientId,
+                treatmentCost,
+                fabricTxId: fabricResult.txId,
+                ethereumTxHash: ethereumResult.txHash
+            });
+        }
+
+        res.json({
+            success: true,
+            claimId,
+            transactions: {
+                fabric: fabricResult,
+                ethereum: ethereumResult,
+                bigchaindb: bigchainResult
+            }
+        });
+
+    } catch (error) {
+        console.error('Claim submission error:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// Get claim status
+router.get('/:claimId', authenticateToken, async (req, res) => {
+    try {
+        const { claimId } = req.params;
+        
+        // Get claim from Fabric
+        const fabricClaim = await getClaimFromFabric(claimId);
+        
+        // Get claim from Ethereum
+        const ethereumClaim = await getClaimFromEthereum(claimId);
+        
+        res.json({
+            success: true,
+            claim: {
+                ...fabricClaim,
+                ethereumData: ethereumClaim
+            }
+        });
+
+    } catch (error) {
+        console.error('Get claim error:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// Approve claim (Insurance only)
+router.post('/:claimId/approve', authenticateToken, checkRole(['insurance']), async (req, res) => {
+    try {
+        const { claimId } = req.params;
+        
+        // Approve in Fabric
+        const fabricResult = await approveClaimInFabric(claimId);
+        
+        // Approve in Ethereum
+        const ethereumResult = await approveClaimInEthereum(claimId);
+        
+        res.json({
+            success: true,
+            message: 'Claim approved successfully',
+            transactions: {
+                fabric: fabricResult,
+                ethereum: ethereumResult
+            }
+        });
+
+    } catch (error) {
+        console.error('Claim approval error:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// Get patient claims
+router.get('/patient/:patientId', authenticateToken, async (req, res) => {
+    try {
+        const { patientId } = req.params;
+        
+        // Verify user has permission to view this patient's data
+        if (req.user.role !== 'admin' && req.user.patientId !== patientId) {
+            return res.status(403).json({
+                success: false,
+                error: 'Access denied'
+            });
+        }
+        
+        const claims = await getPatientClaimsFromFabric(patientId);
+        
+        res.json({
+            success: true,
+            claims
+        });
+
+    } catch (error) {
+        console.error('Get patient claims error:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+module.exports = router;
+
+// backend/services/ethereum.js
+const Web3 = require('web3');
+const HDWalletProvider = require('@truffle/hdwallet-provider');
+
+class EthereumService {
+    constructor() {
+        this.web3 = null;
+        this.healthInsuranceContract = null;
+        this.healthTokenContract = null;
+        this.accounts = [];
+    }
+
+    async initialize() {
+        const provider = new HDWalletProvider(
+            process.env.ETHEREUM_MNEMONIC,
+            process.env.ETHEREUM_RPC_URL || 'http://localhost:8545'
+        );
+        
+        this.web3 = new Web3(provider);
+        this.accounts = await this.web3.eth.getAccounts();
+        
+        // Initialize contracts
+        const healthInsuranceABI = require('../contracts/HealthInsurance.json');
+        const healthTokenABI = require('../contracts/HealthToken.json');
+        
+        this.healthInsuranceContract = new this.web3.eth.Contract(
+            healthInsuranceABI.abi,
+            process.env.HEALTH_INSURANCE_CONTRACT_ADDRESS
+        );
+        
+        this.healthTokenContract = new this.web3.eth.Contract(
+            healthTokenABI.abi,
+            process.env.HEALTH_TOKEN_CONTRACT_ADDRESS
+        );
+    }
+
+    async submitClaim(claimData) {
+        try {
+            const { claimId, policyId, patientId, treatmentCost, diagnosis, documentHashes } = claimData;
+            
+            const tx = await this.healthInsuranceContract.methods.submitClaim(
+                policyId,
+                patientId,
+                treatmentCost,
+                diagnosis,
+                documentHashes
+            ).send({
+                from: this.accounts[0],
+                gas: 500000
+            });
+            
+            return {
+                txHash: tx.transactionHash,
+                blockNumber: tx.blockNumber,
+                gasUsed: tx.gasUsed
+            };
+
+        } catch (error) {
+            throw new Error(`Ethereum claim submission failed: ${error.message}`);
+        }
+    }
+
+    async createPolicy(policyData) {
+        try {
+            const { policyId, patientId, coverageAmount, premium, conditions } = policyData;
+            
+            const tx = await this.healthInsuranceContract.methods.createPolicy(
+                policyId,
+                patientId,
+                coverageAmount,
+                premium,
+                conditions
+            ).send({
+                from: this.accounts[0],
+                gas: 500000
+            });
+            
+            return {
+                txHash: tx.transactionHash,
+                blockNumber: tx.blockNumber
+            };
+
+        } catch (error) {
+            throw new Error(`Ethereum policy creation failed: ${error.message}`);
+        }
+    }
+
+    async getClaim(claimId) {
+        try {
+            const claim = await this.healthInsuranceContract.methods.getClaim(claimId).call();
+            return claim;
+        } catch (error) {
+            throw new Error(`Failed to get claim from Ethereum: ${error.message}`);
+        }
+    }
+
+    async getTokenBalance(address) {
+        try {
+            const balance = await this.healthTokenContract.methods.balanceOf(address).call();
+            return this.web3.utils.fromWei(balance, 'ether');
+        } catch (error) {
+            throw new Error(`Failed to get token balance: ${error.message}`);
+        }
+    }
+
+    async transferTokens(from, to, amount) {
+        try {
+            const amountWei = this.web3.utils.toWei(amount.toString(), 'ether');
+            
+            const tx = await this.healthTokenContract.methods.transfer(to, amountWei).send({
+                from: from,
+                gas: 100000
+            });
+            
+            return {
+                txHash: tx.transactionHash,
+                blockNumber: tx.blockNumber
+            };
+
+        } catch (error) {
+            throw new Error(`Token transfer failed: ${error.message}`);
+        }
+    }
+}
+
+module.exports = new EthereumService();
+
+// backend/services/fabric.js
+const { Gateway, Wallets } = require('fabric-network');
+const FabricCAServices = require('fabric-ca-client');
+const path = require('path');
+const fs = require('fs');
+
+class FabricService {
+    constructor() {
+        this.gateway = null;
+        this.contract = null;
+        this.wallet = null;
+    }
+
+    async initialize() {
+        try {
+            // Load connection profile
+            const ccpPath = path.resolve(__dirname, '..', '..', 'fabric', 'connection-profile.json');
+            const ccp = JSON.parse(fs.readFileSync(ccpPath, 'utf8'));
+
+            // Create wallet
+            const walletPath = path.join(process.cwd(), 'wallet');
+            this.wallet = await Wallets.newFileSystemWallet(walletPath);
+
+            // Check if admin user exists
+            const adminIdentity = await this.wallet.get('admin');
+            if (!adminIdentity) {
+                await this.enrollAdmin(ccp);
+            }
+
+            // Create gateway
+            this.gateway = new Gateway();
+            await this.gateway.connect(ccp, {
+                wallet: this.wallet,
+                identity: 'admin',
+                discovery: { enabled: true, asLocalhost: true }
+            });
+
+            // Get network and contract
+            const network = await this.gateway.getNetwork('healthinsurance-channel');
+            this.contract = network.getContract('health-insurance-chaincode');
+
+            console.log('✅ Fabric service initialized successfully');
+
+        } catch (error) {
+            console.error('❌ Failed to initialize Fabric service:', error);
+            throw error;
+        }
+    }
+
+    async enrollAdmin(ccp) {
+        try {
+            const caInfo = ccp.certificateAuthorities['ca.org1.example.com'];
+            const caTLSCACerts = caInfo.tlsCACerts.pem;
+            const ca = new FabricCAServices(caInfo.url, { trustedRoots: caTLSCACerts, verify: false }, caInfo.caName);
+
+            const enrollment = await ca.enroll({
+                enrollmentID: 'admin',
+                enrollmentSecret: 'adminpw'
+            });
+
+            const x509Identity = {
+                credentials: {
+                    certificate: enrollment.certificate,
+                    privateKey: enrollment.key.toBytes(),
+                },
+                mspId: 'Org1MSP',
+                type: 'X.509',
+            };
+
+            await this.wallet.put('admin', x509Identity);
+            console.log('Successfully enrolled admin user and imported it into the wallet');
+
+        } catch (error) {
+            console.error('Failed to enroll admin user:', error);
+            throw error;
+        }
+    }
+
+    async submitClaim(claimData) {
+        try {
+            const { claimId, policyId, patientId, hospitalId, diagnosis, treatmentCost, documentHashes } = claimData;
+
+            const result = await this.contract.submitTransaction(
+                'SubmitClaim',
+                claimId,
+                policyId,
+                patientId,
+                hospitalId,
+                diagnosis,
+                treatmentCost.toString(),
+                JSON.stringify(documentHashes)
+            );
+
+            return {
+                txId: result.toString(),
+                claimId: claimId,
+                status: 'submitted'
+            };
+
+        } catch (error) {
+            throw new Error(`Fabric claim submission failed: ${error.message}`);
+        }
+    }
+
+    async createPolicy(policyData) {
+        try {
+            const { policyId, patientId, insuranceCompany, coverageAmount, premium, conditions } = policyData;
+
+            const result = await this.contract.submitTransaction(
+                'CreatePolicy',
+                policyId,
+                patientId,
+                insuranceCompany,
+                coverageAmount.toString(),
+                premium.toString(),
+                JSON.stringify(conditions)
+            );
+
+            return {
+                txId: result.toString(),
+                policyId: policyId
+            };
+
+        } catch (error) {
+            throw new Error(`Fabric policy creation failed: ${error.message}`);
+        }
+    }
+
+    async getClaim(claimId) {
+        try {
+            const result = await this.contract.evaluateTransaction('GetClaim', claimId);
+            return JSON.parse(result.toString());
+        } catch (error) {
+            throw new Error(`Failed to get claim from Fabric: ${error.message}`);
+        }
+    }
+
+    async getPolicy(policyId) {
+        try {
+            const result = await this.contract.evaluateTransaction('GetPolicy', policyId);
+            return JSON.parse(result.toString());
+        } catch (error) {
+            throw new Error(`Failed to get policy from Fabric: ${error.message}`);
+        }
+    }
+
+    async getPatientClaims(patientId) {
+        try {
+            const result = await this.contract.evaluateTransaction('GetPatientClaims', patientId);
+            return JSON.parse(result.toString());
+        } catch (error) {
+            throw new Error(`Failed to get patient claims from Fabric: ${error.message}`);
+        }
+    }
+
+    async approveClaim(claimId) {
+        try {
+            const result = await this.contract.submitTransaction('ApproveClaim', claimId);
+            return {
+                txId: result.toString(),
+                claimId: claimId,
+                status: 'approved'
+            };
+        } catch (error) {
+            throw new Error(`Failed to approve claim in Fabric: ${error.message}`);
+        }
+    }
+
+    async shareData(recordId, toOrg, dataType, dataHash, purpose) {
+        try {
+            const result = await this.contract.submitTransaction(
+                'ShareData',
+                recordId,
+                toOrg,
+                dataType,
+                dataHash,
+                purpose
+            );
+
+            return {
+                txId: result.toString(),
+                recordId: recordId
+            };
+
+        } catch (error) {
+            throw new Error(`Failed to share data in Fabric: ${error.message}`);
+        }
+    }
+
+    async disconnect() {
+        if (this.gateway) {
+            await this.gateway.disconnect();
+        }
+    }
+}
+
+module.exports = new FabricService();
+
+// backend/services/bigchaindb.js
+const driver = require('bigchaindb-driver');
+
+class BigchainDBService {
+    constructor() {
+        this.connection = null;
+        this.keypair = null;
+    }
+
+    async initialize() {
+        try {
+            this.connection = new driver.Connection(
+                process.env.BIGCHAINDB_API_PATH || 'http://localhost:9984/api/v1/'
+            );
+
+            // Generate or load keypair
+            this.keypair = new driver.Ed25519Keypair();
+
+            console.log('✅ BigchainDB service initialized successfully');
+
+        } catch (error) {
+            console.error('❌ Failed to initialize BigchainDB service:', error);
+            throw error;
+        }
+    }
+
+    async storeLargeClaim(claimData) {
+        try {
+            const { claimId, policyId, patientId, treatmentCost, fabricTxId, ethereumTxHash } = claimData;
+
+            // Create asset
+            const asset = {
+                data: {
+                    type: 'large_health_claim',
+                    claimId: claimId,
+                    policyId: policyId,
+                    patientId: patientId,
+                    treatmentCost: treatmentCost,
+                    storedAt: new Date().toISOString(),
+                    fabricTxId: fabricTxId,
+                    ethereumTxHash: ethereumTxHash
+                }
+            };
+
+            // Metadata
+            const metadata = {
+                timestamp: new Date().toISOString(),
+                source: 'HealthInsureChain',
+                category: 'large_claim',
+                amount_threshold: 50000
+            };
+
+            // Create transaction
+            const txCreateAlice = driver.Transaction.makeCreateTransaction(
+                asset,
+                metadata,
+                [driver.Transaction.makeOutput(driver.Transaction.makeEd25519Condition(this.keypair.publicKey))],
+                this.keypair.publicKey
+            );
+
+            // Sign transaction
+            const txCreateAliceSigned = driver.Transaction.signTransaction(txCreateAlice, this.keypair.privateKey);
+
+            // Send transaction
+            const retrievedTx = await this.connection.postTransactionCommit(txCreateAliceSigned);
+
+            return {
+                transactionId: retrievedTx.id,
+                assetId: retrievedTx.id,
+                claimId: claimId,
+                status: 'stored'
+            };
+
+        } catch (error) {
+            throw new Error(`BigchainDB storage failed: ${error.message}`);
+        }
+    }
+
+    async getLargeClaim(transactionId) {
+        try {
+            const transaction = await this.connection.getTransaction(transactionId);
+            return transaction;
+        } catch (error) {
+            throw new Error(`Failed to retrieve from BigchainDB: ${error.message}`);
+        }
+    }
+
+    async queryClaimsByPatient(patientId) {
+        try {
+            const assets = await this.connection.searchAssets(`patientId:${patientId}`);
+            return assets;
+        } catch (error) {
+            throw new Error(`Failed to query BigchainDB: ${error.message}`);
+        }
+    }
+
+    async transferClaim(transactionId, newOwnerPublicKey) {
+        try {
+            // Get the transaction
+            const createTx = await this.connection.getTransaction(transactionId);
+
+            // Create transfer transaction
+            const transferTx = driver.Transaction.makeTransferTransaction(
+                [{ tx: createTx, output_index: 0 }],
+                [driver.Transaction.makeOutput(driver.Transaction.makeEd25519Condition(newOwnerPublicKey))],
+                { transferred_at: new Date().toISOString() }
+            );
+
+            // Sign and submit
+            const transferTxSigned = driver.Transaction.signTransaction(transferTx, this.keypair.privateKey);
+            const retrievedTransferTx = await this.connection.postTransactionCommit(transferTxSigned);
+
+            return {
+                transactionId: retrievedTransferTx.id,
+                status: 'transferred'
+            };
+
+        } catch (error) {
+            throw new Error(`BigchainDB transfer failed: ${error.message}`);
+        }
+    }
+}
+
+module.exports = new BigchainDBService();
+
+// =================== CLOUD INTERFACE - FRONTEND ===================
+
+const CloudFrontend = `
+// frontend/src/App.js
+import React, { useState, useEffect } from 'react';
+import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
+import { Toaster } from 'react-hot-toast';
+import { AuthProvider, useAuth } from './contexts/AuthContext';
+import { BlockchainProvider } from './contexts/BlockchainContext';
+
+// Components
+import Header from './components/Layout/Header';
+import Sidebar from './components/Layout/Sidebar';
+import Login from './components/Auth/Login';
+import Dashboard from './components/Dashboard/Dashboard';
+import PatientDashboard from './components/Patient/PatientDashboard';
+import HospitalDashboard from './components/Hospital/HospitalDashboard';
+import InsuranceDashboard from './components/Insurance/InsuranceDashboard';
+import PolicyManagement from './components/Policy/PolicyManagement';
+import ClaimManagement from './components/Claim/ClaimManagement';
+import TokenWallet from './components/Token/TokenWallet';
+import BlockchainExplorer from './components/Blockchain/BlockchainExplorer';
+import Analytics from './components/Analytics/Analytics';
+
+// Styles
+import './App.css';
+import 'tailwindcss/tailwind.css';
+
+function App() {
+  return (
+    <AuthProvider>
+      <BlockchainProvider>
+        <Router>
+          <div className="App">
+            <Toaster 
+              position="top-right"
+              toastOptions={{
+                duration: 4000,
+                style: {
+                  background: '#363636',
+                  color: '#fff',
+                },
+              }}
+            />
+            <Routes>
+              <Route path="/login" element={<Login />} />
+              <Route path="/*" element={<ProtectedApp />} />
+            </Routes>
+          </div>
+        </Router>
+      </BlockchainProvider>
+    </AuthProvider>
+  );
+}
+
+function ProtectedApp() {
+  const { user, loading } = useAuth();
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+
+  if (loading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <div className="animate-spin rounded-full h-32 w-32 border-b-2 border-blue-600"></div>
+      </div>
+    );
+  }
+
+  if (!user) {
+    return <Navigate to="/login" />;
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-50">
+      <Header onMenuClick={() => setSidebarOpen(!sidebarOpen)} />
+      <div className="flex">
+        <Sidebar isOpen={sidebarOpen} userRole={user.role} />
+        <main className={`flex-1 p-6 transition-all duration-300 ${sidebarOpen ? 'ml-64' : 'ml-16'}`}>
+          <Routes>
+            <Route path="/" element={<DashboardRouter userRole={user.role} />} />
+            <Route path="/policies" element={<PolicyManagement />} />
+            <Route path="/claims" element={<ClaimManagement />} />
+            <Route path="/wallet" element={<TokenWallet />} />
+            <Route path="/blockchain" element={<BlockchainExplorer />} />
+            <Route path="/analytics" element={<Analytics />} />
+          </Routes>
+        </main>
+      </div>
+    </div>
+  );
+}
+
+function DashboardRouter({ userRole }) {
+  switch (userRole) {
+    case 'patient':
+      return <PatientDashboard />;
+    case 'hospital':
+      return <HospitalDashboard />;
+    case 'insurance':
+      return <InsuranceDashboard />;
+    default:
+      return <Dashboard />;
+  }
+}
+
+export default App;
+
+// frontend/src/components/Dashboard/Dashboard.js
+import React, { useState, useEffect } from 'react';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../ui/card';
+import { Badge } from '../ui/badge';
+import { Button } from '../ui/button';
+import { useBlockchain } from '../../contexts/BlockchainContext';
+import { Activity, Users, FileText, DollarSign, TrendingUp, Shield } from 'lucide-react';
+
+const Dashboard = () => {
+  const { blockchainStats, refreshStats } = useBlockchain();
+  const [recentActivity, setRecentActivity] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    loadDashboardData();
+  }, []);
+
+  const loadDashboardData = async () => {
+    setLoading(true);
+    try {
+      await refreshStats();
+      // Load recent activity
+      const response = await fetch('/api/blockchain/recent-activity');
+      const data = await response.json();
+      setRecentActivity(data.activities || []);
+    } catch (error) {
+      console.error('Failed to load dashboard data:', error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const statsCards = [
+    {
+      title: 'Total Policies',
+      value: blockchainStats.totalPolicies,
+      icon: Shield,
+      change: '+12%',
+      changeType: 'positive'
+    },
+    {
+      title: 'Active Claims',
+      value: blockchainStats.activeClaims,
+      icon: FileText,
+      change: '+8%',
+      changeType: 'positive'
+    },
+    {
+      title: 'Total Patients',
+      value: blockchainStats.totalPatients,
+      icon: Users,
+      change: '+15%',
+      changeType: 'positive'
+    },
+    {
+      title: 'Claims Value',
+      value: `${blockchainStats.totalClaimsValue?.toLocaleString()}`,
+      icon: DollarSign,
+      change: '+23%',
+      changeType: 'positive'
+    }
+  ];
+
+  if (loading) {
+    return (
+      <div className="space-y-6">
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+          {[...Array(4)].map((_, i) => (
+            <Card key={i} className="animate-pulse">
+              <CardContent className="p-6">
+                <div className="h-4 bg-gray-200 rounded w-1/2 mb-2"></div>
+                <div className="h-8 bg-gray-200 rounded w-1/3"></div>
+              </CardContent>
+            </Card>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      {/* Header */}
+      <div className="flex justify-between items-center">
+        <div>
+          <h1 className="text-3xl font-bold text-gray-900">HealthInsureChain Dashboard</h1>
+          <p className="text-gray-600 mt-2">Monitor your blockchain health insurance network</p>
+        </div>
+        <Button onClick={loadDashboardData} className="bg-blue-600 hover:bg-blue-700">
+          Refresh Data
+        </Button>
+      </div>
+
+      {/* Stats Cards */}
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+        {statsCards.map((stat, index) => (
+          <Card key={index} className="hover:shadow-lg transition-shadow">
+            <CardContent className="p-6">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-sm font-medium text-gray-600">{stat.title}</p>
+                  <p className="text-3xl font-bold text-gray-900 mt-2">{stat.value}</p>
+                </div>
+                <div className={`p-3 rounded-full ${
+                  stat.changeType === 'positive' ? 'bg-green-100 text-green-600' : 'bg-red-100 text-red-600'
+                }`}>
+                  <stat.icon className="h-6 w-6" />
+                </div>
+              </div>
+              <div className="flex items-center mt-4">
+                <TrendingUp className={`h-4 w-4 ${
+                  stat.changeType === 'positive' ? 'text-green-600' : 'text-red-600'
+                }`} />
+                <span className={`text-sm ml-2 ${
+                  stat.changeType === 'positive' ? 'text-green-600' : 'text-red-600'
+                }`}>
+                  {stat.change}
+                </span>
+                <span className="text-sm text-gray-600 ml-2">vs last month</span>
+              </div>
+            </CardContent>
+          </Card>
+        ))}
+      </div>
+
+      {/* Recent Activity and Blockchain Status */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        {/* Recent Activity */}
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Activity className="h-5 w-5" />
+              Recent Activity
+            </CardTitle>
+            <CardDescription>Latest blockchain transactions and events</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="space-y-4">
+              {recentActivity.map((activity, index) => (
+                <div key={index} className="flex items-center justify-between p-3 bg-gray-50 rounded-lg">
+                  <div className="flex items-center space-x-3">
+                    <div className={`w-3 h-3 rounded-full ${
+                      activity.type === 'claim' ? 'bg-blue-500' : 
+                      activity.type === 'policy' ? 'bg-green-500' : 'bg-purple-500'
+                    }`}></div>
+                    <div>
+                      <p className="text-sm font-medium text-gray-900">{activity.title}</p>
+                      <p className="text-xs text-gray-600">{activity.description}</p>
+                    </div>
+                  </div>
+                  <Badge variant={activity.status === 'completed' ? 'success' : 'pending'}>
+                    {activity.status}
+                  </Badge>
+                </div>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* Blockchain Status */}
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Shield className="h-5 w-5" />
+              Blockchain Network Status
+            </CardTitle>
+            <CardDescription>Real-time network health and performance</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="space-y-4">
+              <div className="flex justify-between items-center">
+                <span className="text-sm text-gray-600">Ethereum Network</span>
+                <Badge className="bg-green-100 text-green-800">Connected</Badge>
+              </div>
+              <div className="flex justify-between items-center">
+                <span className="text-sm text-gray-600">Hyperledger Fabric</span>
+                <Badge className="bg-green-100 text-green-800">Active</Badge>
+              </div>
+              <div className="flex justify-between items-center">
+                <span className="text-sm text-gray-600">BigchainDB</span>
+                <Badge className="bg-green-100 text-green-800">Online</Badge>
+              </div>
+              <div className="flex justify-between items-center">
+                <span className="text-sm text-gray-600">Rust Miner</span>
+                <Badge className="bg-blue-100 text-blue-800">Mining</Badge>
+              </div>
+              <div className="pt-4 border-t">
+                <div className="flex justify-between text-sm">
+                  <span className="text-gray-600">Block Height</span>
+                  <span className="font-medium">{blockchainStats.blockHeight}</span>
+                </div>
+                <div className="flex justify-between text-sm mt-2">
+                  <span className="text-gray-600">Network Hash Rate</span>
+                  <span className="font-medium">2.5 TH/s</span>
+                </div>
+                <div className="flex justify-between text-sm mt-2">
+                  <span className="text-gray-600">Last Block</span>
+                  <span className="font-medium">2 min ago</span>
+                </div>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+    </div>
+  );
+};
+
+export default Dashboard;
+
+// =================== BIGCHAINDB SETUP ===================
+
+const BigchainDBSetup = `
+# docker-compose.yml for BigchainDB
+version: '3.7'
+
+services:
+  # MongoDB for BigchainDB
+  mongodb:
+    image: mongo:4.4
+    container_name: bigchaindb_mongodb
+    restart: always
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: bigchaindb
+      MONGO_INITDB_ROOT_PASSWORD: bigchaindb
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - bigchaindb_network
+
+  # BigchainDB Server
+  bigchaindb:
+    image: bigchaindb/bigchaindb:2.2.2
+    container_name: bigchaindb_server
+    restart: always
+    ports:
+      - "9984:9984"
+      - "9985:9985"
+    environment:
+      BIGCHAINDB_DATABASE_BACKEND: mongodb
+      BIGCHAINDB_DATABASE_HOST: mongodb
+      BIGCHAINDB_DATABASE_PORT: 27017
+      BIGCHAINDB_DATABASE_NAME: bigchaindb
+      BIGCHAINDB_DATABASE_USERNAME: bigchaindb
+      BIGCHAINDB_DATABASE_PASSWORD: bigchaindb
+      BIGCHAINDB_SERVER_BIND: 0.0.0.0:9984
+      BIGCHAINDB_WSSERVER_HOST: 0.0.0.0
+      BIGCHAINDB_WSSERVER_PORT: 9985
+      BIGCHAINDB_WSSERVER_ADVERTISED_HOST: bigchaindb
+      BIGCHAINDB_WSSERVER_ADVERTISED_PORT: 9985
+    depends_on:
+      - mongodb
+    volumes:
+      - ./scripts/bigchaindb_configure.sh:/usr/local/bin/bigchaindb_configure.sh
+    networks:
+      - bigchaindb_network
+    command: bash -c "
+      bigchaindb configure &&
+      bigchaindb init &&
+      bigchaindb start
+    "
+
+volumes:
+  mongodb_data:
+
+networks:
+  bigchaindb_network:
+    driver: bridge
+
+# scripts/bigchaindb_configure.sh
+#!/bin/bash
+
+# BigchainDB configuration script for HealthInsureChain
+echo "Configuring BigchainDB for HealthInsureChain..."
+
+# Set configuration
+export BIGCHAINDB_CONFIG_PATH=/tmp/bigchaindb_config.json
+
+cat > $BIGCHAINDB_CONFIG_PATH << EOF
+{
+  "server": {
+    "bind": "0.0.0.0:9984",
+    "loglevel": "info",
+    "workers": 1
+  },
+  "wsserver": {
+    "scheme": "ws",
+    "host": "0.0.0.0",
+    "port": 9985,
+    "advertised_scheme": "ws",
+    "advertised_host": "bigchaindb",
+    "advertised_port": 9985
+  },
+  "database": {
+    "backend": "mongodb",
+    "host": "mongodb",
+    "port": 27017,
+    "name": "bigchaindb",
+    "username": "bigchaindb",
+    "password": "bigchaindb",
+    "connection_timeout": 5000,
+    "max_tries": 3
+  },
+  "log": {
+    "level": "info",
+    "file": "/var/log/bigchaindb.log"
+  }
+}
+EOF
+
+echo "BigchainDB configuration completed!"
+`;
+
+// =================== DEPLOYMENT SCRIPTS ===================
+
+const DeploymentScripts = `
+#!/bin/bash
+# deploy.sh - Complete deployment script for HealthInsureChain
+
+echo "🏥 HealthInsureChain Deployment Script"
+echo "======================================"
+
+# Check prerequisites
+check_prerequisites() {
+    echo "Checking prerequisites..."
+    
+    # Check Docker
+    if ! command -v docker &> /dev/null; then
+        echo "❌ Docker is not installed"
+        exit 1
+    fi
+    
+    # Check Node.js
+    if ! command -v node &> /dev/null; then
+        echo "❌ Node.js is not installed"
+        exit 1
+    fi
+    
+    # Check Rust
+    if ! command -v cargo &> /dev/null; then
+        echo "❌ Rust is not installed"
+        exit 1
+    fi
+    
+    # Check Go
+    if ! command -v go &> /dev/null; then
+        echo "❌ Go is not installed"
+        exit 1
+    fi
+    
+    echo "✅ All prerequisites satisfied"
+}
+
+# Deploy Ethereum Private Chain
+deploy_ethereum() {
+    echo "📦 Deploying Ethereum Private Chain..."
+    
+    cd ethereum-private-chain
+    
+    # Install dependencies
+    npm install
+    
+    # Compile contracts
+    npx truffle compile
+    
+    # Start Ganache
+    npx ganache-cli --deterministic --accounts 10 --host 0.0.0.0 --port 8545 &
+    GANACHE_PID=$!
+    
+    sleep 5
+    
+    # Deploy contracts
+    npx truffle migrate --network development
+    
+    echo "✅ Ethereum contracts deployed"
+    cd ..
+}
+
+# Build and start Rust Miner
+deploy_rust_miner() {
+    echo "⛏️  Building and starting Rust Miner..."
+    
+    cd rust-miner
+    
+    # Build Rust miner
+    cargo build --release
+    
+    # Start miner in background
+    ./target/release/health-insurance-miner \
+        --difficulty 4 \
+        --ethereum-rpc http://localhost:8545 &
+    MINER_PID=$!
+    
+    echo "✅ Rust miner started (PID: $MINER_PID)"
+    cd ..
+}
+
+# Deploy Hyperledger Fabric Network
+deploy_fabric() {
+    echo "🔗 Deploying Hyperledger Fabric Network..."
+    
+    cd hyperledger-fabric
+    
+    # Generate crypto materials
+    cryptogen generate --config=crypto-config.yaml
+    
+    # Generate genesis block and channel artifacts
+    configtxgen -profile ThreeOrgsOrdererGenesis -channelID system-channel -outputBlock ./system-genesis-block/genesis.block
+    configtxgen -profile ThreeOrgsChannel -outputCreateChannelTx ./channel-artifacts/healthinsurance-channel.tx -channelID healthinsurance-channel
+    
+    # Start Fabric network
+    docker-compose -f docker-compose.yml up -d
+    
+    # Wait for network to start
+    sleep 30
+    
+    # Create channel
+    docker exec cli peer channel create -o orderer.healthinsure.com:7050 -c healthinsurance-channel -f ./channel-artifacts/healthinsurance-channel.tx --tls --cafile /opt/gopath/src/github.com/hyperledger/fabric/peer/organizations/ordererOrganizations/healthinsure.com/orderers/orderer.healthinsure.com/msp/tlscacerts/tlsca.healthinsure.com-cert.pem
+    
+    # Join peers to channel
+    docker exec cli peer channel join -b healthinsurance-channel.block
+    
+    # Install and instantiate chaincode
+    docker exec cli peer lifecycle chaincode package health-insurance.tar.gz --path /opt/gopath/src/github.com/chaincode/health-insurance --lang golang --label health-insurance_1.0
+    docker exec cli peer lifecycle chaincode install health-insurance.tar.gz
+    
+    echo "✅ Hyperledger Fabric network deployed"
+    cd ..
+}
+
+# Deploy BigchainDB
+deploy_bigchaindb() {
+    echo "🗄️  Deploying BigchainDB..."
+    
+    cd bigchaindb
+    
+    # Start BigchainDB
+    docker-compose up -d
+    
+    # Wait for BigchainDB to initialize
+    sleep 60
+    
+    echo "✅ BigchainDB deployed"
+    cd ..
+}
+
+# Deploy Backend Services
+deploy_backend() {
+    echo "🖥️  Deploying Backend Services..."
+    
+    cd cloud-interface/backend
+    
+    # Install dependencies
+    npm install
+    
+    # Set environment variables
+    export NODE_ENV=production
+    export ETHEREUM_RPC_URL=http://localhost:8545
+    export FABRIC_NETWORK_PATH=../../hyperledger-fabric
+    export BIGCHAINDB_API_PATH=http://localhost:9984/api/v1/
+    export MONGODB_URI=mongodb://localhost:27017/healthinsurechain
+    
+    # Start backend server
+    npm start &
+    BACKEND_PID=$!
+    
+    echo "✅ Backend services started (PID: $BACKEND_PID)"
+    cd ../..
+}
+
+# Deploy Frontend Application
+deploy_frontend() {
+    echo "🌐 Deploying Frontend Application..."
+    
+    cd cloud-interface/frontend
+    
+    # Install dependencies
+    npm install
+    
+    # Build frontend
+    npm run build
+    
+    # Start frontend server
+    npm start &
+    FRONTEND_PID=$!
+    
+    echo "✅ Frontend application started (PID: $FRONTEND_PID)"
+    cd ../..
+}
+
+# Initialize sample data
+initialize_sample_data() {
+    echo "📝 Initializing sample data..."
+    
+    # Wait for all services to be ready
+    sleep 30
+    
+    # Create sample policies and claims
+    curl -X POST http://localhost:3000/api/policies \
+      -H "Content-Type: application/json" \
+      -d '{
+        "policyId": "POL001",
+        "patientId": "PAT001", 
+        "insuranceCompany": "HealthSecure Inc.",
+        "coverageAmount": 75000,
+        "premium": 500,
+        "conditions": ["None"]
+      }'
+    
+    curl -X POST http://localhost:3000/api/claims/submit \
+      -H "Content-Type: application/json" \
+      -d '{
+        "policyId": "POL001",
+        "patientId": "PAT001",
+        "diagnosis": "Routine Checkup",
+        "treatmentCost": 500,
+        "documentHashes": ["doc1_hash", "doc2_hash", "doc3_hash"],
+        "hospitalId": "HOS001"
+      }'
+    
+    echo "✅ Sample data initialized"
+}
+
+# Monitor deployment
+monitor_deployment() {
+    echo "📊 Monitoring deployment..."
+    
+    # Check Ethereum
+    if curl -s http://localhost:8545 > /dev/null; then
+        echo "✅ Ethereum RPC: Running"
+    else
+        echo "❌ Ethereum RPC: Not responding"
+    fi
+    
+    # Check Fabric
+    if docker ps | grep -q peer0.hospital; then
+        echo "✅ Hyperledger Fabric: Running"
+    else
+        echo "❌ Hyperledger Fabric: Not running"
+    fi
+    
+    # Check BigchainDB
+    if curl -s http://localhost:9984 > /dev/null; then
+        echo "✅ BigchainDB: Running"
+    else
+        echo "❌ BigchainDB: Not responding"
+    fi
+    
+    # Check Backend
+    if curl -s http://localhost:3000/health > /dev/null; then
+        echo "✅ Backend API: Running"
+    else
+        echo "❌ Backend API: Not responding"
+    fi
+    
+    # Check Frontend
+    if curl -s http://localhost:3001 > /dev/null; then
+        echo "✅ Frontend: Running"
+    else
+        echo "❌ Frontend: Not responding"
+    fi
+}
+
+# Cleanup function
+cleanup() {
+    echo "🧹 Cleaning up processes..."
+    if [ ! -z "$GANACHE_PID" ]; then kill $GANACHE_PID 2>/dev/null; fi
+    if [ ! -z "$MINER_PID" ]; then kill $MINER_PID 2>/dev/null; fi
+    if [ ! -z "$BACKEND_PID" ]; then kill $BACKEND_PID 2>/dev/null; fi
+    if [ ! -z "$FRONTEND_PID" ]; then kill $FRONTEND_PID 2>/dev/null; fi
+    docker-compose -f hyperledger-fabric/docker-compose.yml down 2>/dev/null
+    docker-compose -f bigchaindb/docker-compose.yml down 2>/dev/null
+}
+
+# Trap cleanup on script exit
+trap cleanup EXIT
+
+# Main deployment flow
+main() {
+    echo "Starting HealthInsureChain deployment..."
+    
+    check_prerequisites
+    deploy_ethereum
+    deploy_rust_miner
+    deploy_fabric
+    deploy_bigchaindb
+    deploy_backend
+    deploy_frontend
+    initialize_sample_data
+    monitor_deployment
+    
+    echo ""
+    echo "🎉 HealthInsureChain deployment completed!"
+    echo ""
+    echo "📱 Frontend: http://localhost:3001"
+    echo "🔌 Backend API: http://localhost:3000"
+    echo "⛓️  Ethereum RPC: http://localhost:8545"
+    echo "🗄️  BigchainDB: http://localhost:9984"
+    echo ""
+    echo "Press Ctrl+C to stop all services"
+    
+    # Keep script running
+    while true; do
+        sleep 60
+        monitor_deployment
+    done
+}
+
+# Start deployment if script is run directly
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
+
+# =================== PACKAGE.JSON FILES ===================
+
+# Root package.json
+{
+  "name": "healthinsurechain",
+  "version": "1.0.0",
+  "description": "Complete blockchain-based health insurance claim verification system",
+  "main": "index.js",
+  "scripts": {
+    "deploy": "./scripts/deploy.sh",
+    "start": "concurrently \"npm run start:backend\" \"npm run start:frontend\" \"npm run start:miner\"",
+    "start:backend": "cd cloud-interface/backend && npm start",
+    "start:frontend": "cd cloud-interface/frontend && npm start",
+    "start:miner": "cd rust-miner && cargo run --release",
+    "build": "npm run build:contracts && npm run build:chaincode && npm run build:frontend",
+    "build:contracts": "cd ethereum-private-chain && npx truffle compile",
+    "build:chaincode": "cd hyperledger-fabric/chaincode/health-insurance && go build",
+    "build:frontend": "cd cloud-interface/frontend && npm run build",
+    "test": "npm run test:contracts && npm run test:chaincode && npm run test:backend",
+    "test:contracts": "cd ethereum-private-chain && npx truffle test",
+    "test:chaincode": "cd hyperledger-fabric/chaincode/health-insurance && go test",
+    "test:backend": "cd cloud-interface/backend && npm test",
+    "clean": "./scripts/clean.sh",
+    "logs": "./scripts/logs.sh"
+  },
+  "keywords": [
+    "blockchain",
+    "health-insurance",
+    "ethereum",
+    "hyperledger-fabric",
+    "bigchaindb",
+    "smart-contracts",
+    "rust",
+    "defi",
+    "healthcare"
+  ],
+  "author": "HealthInsureChain Team",
+  "license": "MIT",
+  "devDependencies": {
+    "concurrently": "^7.6.0",
+    "nodemon": "^2.0.20"
+  },
+  "engines": {
+    "node": ">=16.0.0",
+    "npm": ">=8.0.0"
+  }
+}
+
+# Backend package.json
+{
+  "name": "healthinsurechain-backend",
+  "version": "1.0.0",
+  "description": "HealthInsureChain Backend API",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "lint": "eslint . --ext .js",
+    "lint:fix": "eslint . --ext .js --fix"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "helmet": "^6.1.5",
+    "express-rate-limit": "^6.7.0",
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.0",
+    "mongoose": "^7.2.0",
+    "multer": "^1.4.5-lts.1",
+    "joi": "^17.9.2",
+    "web3": "^4.0.1",
+    "@truffle/hdwallet-provider": "^2.1.9",
+    "fabric-network": "^2.2.19",
+    "fabric-ca-client": "^2.2.19",
+    "bigchaindb-driver": "^4.2.0",
+    "redis": "^4.6.7",
+    "socket.io": "^4.6.2",
+    "winston": "^3.8.2",
+    "dotenv": "^16.1.3"
+  },
+  "devDependencies": {
+    "jest": "^29.5.0",
+    "supertest": "^6.3.3",
+    "nodemon": "^2.0.22",
+    "eslint": "^8.42.0"
+  }
+}
+
+# Frontend package.json
+{
+  "name": "healthinsurechain-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@testing-library/jest-dom": "^5.16.5",
+    "@testing-library/react": "^13.4.0",
+    "@testing-library/user-event": "^13.5.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^6.11.2",
+    "react-scripts": "5.0.1",
+    "web-vitals": "^2.1.4",
+    "axios": "^1.4.0",
+    "react-hot-toast": "^2.4.1",
+    "lucide-react": "^0.244.0",
+    "recharts": "^2.6.2",
+    "date-fns": "^2.30.0",
+    "classnames": "^2.3.2",
+    "web3": "^4.0.1",
+    "@web3-react/core": "^8.2.0",
+    "@web3-react/injected-connector": "^6.0.7",
+    "socket.io-client": "^4.6.2"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "test": "react-scripts test",
+    "eject": "react-scripts eject",
+    "lint": "eslint src --ext .js,.jsx,.ts,.tsx",
+    "lint:fix": "eslint src --ext .js,.jsx,.ts,.tsx --fix"
+  },
+  "eslintConfig": {
+    "extends": [
+      "react-app",
+      "react-app/jest"
+    ]
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  },
+  "devDependencies": {
+    "tailwindcss": "^3.3.2",
+    "autoprefixer": "^10.4.14",
+    "postcss": "^8.4.24",
+    "@types/react": "^18.2.6",
+    "@types/react-dom": "^18.2.4"
+  },
+  "proxy": "http://localhost:3000"
+}
+
+# =================== DOCUMENTATION ===================
+
+# README.md
+# HealthInsureChain: Blockchain-Based Health Insurance System
+
+## 🏥 Overview
+
+HealthInsureChain is a comprehensive blockchain-based health insurance claim verification system that automates insurance approvals and claim validation using multiple blockchain technologies.
+
+## 🏗️ Architecture
+
+### Core Components
+
+1. **Ethereum Private Chain** - Stores policy hashes and executes smart contracts
+2. **Rust Miner** - Confirms policy blocks with custom mining algorithm
+3. **Smart Contracts** - Verify claim conditions and automate approvals
+4. **Hyperledger Fabric** - Enables secure hospital-insurance inter-org data sharing
+5. **Cloud Interface** - Web portal for patients, hospitals, and insurance companies
+6. **ERC20 Token** - Loyalty reward system for patients
+7. **BigchainDB** - Permanent storage for large claims and audit trails
+
+## 🚀 Quick Start
+
+### Prerequisites
+
+- Docker & Docker Compose
+- Node.js (v16+)
+- Rust (latest stable)
+- Go (v1.19+)
+- Python 3.8+
+
+### Deployment
+
+1. Clone the repository:
+\`\`\`bash
+git clone https://github.com/your-org/healthinsurechain.git
+cd healthinsurechain
+\`\`\`
+
+2. Run the deployment script:
+\`\`\`bash
+chmod +x scripts/deploy.sh
+./scripts/deploy.sh
+\`\`\`
+
+3. Access the system:
+- Frontend: http://localhost:3001
+- Backend API: http://localhost:3000
+- Blockchain Explorer: http://localhost:3001/blockchain
+
+## 📱 User Interfaces
+
+### Patient Portal
+- View insurance policies
+- Track claim status
+- Manage HealthCoin tokens
+- Access medical records
+- Submit documents
+
+### Hospital Dashboard
+- Submit insurance claims
+- View patient policies
+- Upload medical documents
+- Track claim approvals
+- Inter-org data sharing
+
+### Insurance Company Dashboard
+- Create and manage policies
+- Review and approve claims
+- Analytics and reporting
+- Fraud detection alerts
+- Token reward management
+
+## 🔧 Technical Details
+
+### Smart Contracts
+
+#### HealthInsurance.sol
+- Policy creation and management
+- Automated claim verification
+- Approval workflows
+- Event emission for tracking
+
+#### HealthToken.sol
+- ERC20-compliant loyalty token
+- Reward distribution
+- Transfer capabilities
+- Balance management
+
+### Hyperledger Fabric Chaincode
+
+#### health-insurance chaincode
+- Cross-organization data sharing
+- Policy verification
+- Claim processing
+- Audit trails
+
+### Rust Miner Features
+
+- Custom proof-of-work algorithm
+- Ethereum integration
+- Configurable difficulty
+- Real-time mining statistics
+
+## 🔐 Security Features
+
+- Multi-signature wallets
+- Role-based access control
+- Data encryption at rest and in transit
+- Immutable audit trails
+- Smart contract security patterns
+- Zero-knowledge proofs for privacy
+
+## 📊 Analytics & Monitoring
+
+- Real-time blockchain metrics
+- Claim approval rates
+- Token circulation statistics
+- Network health monitoring
+- Fraud detection algorithms
+- Performance benchmarks
+
+## 🧪 Testing
+
+Run the complete test suite:
+\`\`\`bash
+npm test
+\`\`\`
+
+Individual component tests:
+\`\`\`bash
+npm run test:contracts    # Smart contract tests
+npm run test:chaincode    # Fabric chaincode tests
+npm run test:backend      # Backend API tests
+npm run test:frontend     # Frontend component tests
+\`\`\`
+
+## 📈 Scalability
+
+- Horizontal scaling with multiple peers
+- Load balancing across blockchain nodes
+- Caching layer for frequent queries
+- Database optimization
+- CDN for static assets
+
+## 🌐 API Documentation
+
+### REST API Endpoints
+
+#### Policies
+- \`POST /api/policies\` - Create new policy
+- \`GET /api/policies/:id\` - Get policy details
+- \`PUT /api/policies/:id\` - Update policy
+- \`DELETE /api/policies/:id\` - Deactivate policy
+
+#### Claims
+- \`POST /api/claims/submit\` - Submit new claim
+- \`GET /api/claims/:id\` - Get claim status
+- \`POST /api/claims/:id/approve\` - Approve claim
+- \`GET /api/claims/patient/:id\` - Get patient claims
+
+#### Tokens
+- \`GET /api/tokens/balance/:address\` - Get token balance
+- \`POST /api/tokens/transfer\` - Transfer tokens
+- \`GET /api/tokens/history/:address\` - Get transaction history
+
+## 🔄 Workflow
+
+### Policy Creation
+1. Insurance company creates policy
+2. Smart contract validates data
+3. Policy hash stored on Ethereum
+4. Fabric records inter-org sharing
+5. Patient receives notification
+
+### Claim Submission
+1. Hospital submits claim
+2. Smart contract auto-verification
+3. Document validation
+4. Approval/rejection decision
+5. Token rewards distributed
+6. Large claims stored in BigchainDB
+
+## 🛠️ Development
+
+### Local Development Setup
+
+1. Install dependencies:
+\`\`\`bash
+npm install
+\`\`\`
+
+2. Start development servers:
+\`\`\`bash
+npm run dev
+\`\`\`
+
+3. Watch for changes:
+\`\`\`bash
+npm run watch
+\`\`\`
+
+### Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Add tests
+5. Submit a pull request
+
+## 📝 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## 🤝 Support
+
+For support and questions:
+- Email: support@healthinsurechain.com
+- Documentation: https://docs.healthinsurechain.com
+- Discord: https://discord.gg/healthinsurechain
+
+## 🚀 Roadmap
+
+- [ ] Mobile applications (iOS/Android)
+- [ ] AI-powered fraud detection
+- [ ] Cross-chain interoperability
+- [ ] Decentralized identity integration
+- [ ] IPFS document storage
+- [ ] Machine learning claim processing
+- [ ] IoT device integration
+- [ ] Regulatory compliance tools
+
+---
+
+**HealthInsureChain** - Revolutionizing healthcare insurance with blockchain technology! 🏥⛓️
+`;
+
+console.log("HealthInsureChain project structure created successfully!");
+console.log("To deploy the complete system, run: ./scripts/deploy.sh");
